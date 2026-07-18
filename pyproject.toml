@@ -1,0 +1,13 @@
+[project]
+name = "matter-h2-direct"
+version = "0.1.0"
+description = "Minimal direct Matter-over-Thread controller using an ESP32-H2"
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "pyserial==3.5",
+    # 2025.x binaries require glibc newer than Debian 11 provides.
+    "python-matter-server[server]==6.6.1",
+]
+
+[tool.uv]
+package = false
