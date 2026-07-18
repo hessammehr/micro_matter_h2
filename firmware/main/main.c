@@ -38,8 +38,10 @@
 #define FRAME_IPV6_TO_HOST 0x02
 #define FRAME_STATUS_REQUEST 0x10
 #define FRAME_STATUS_RESPONSE 0x11
-#define PROTOCOL_VERSION 5
+#define PROTOCOL_VERSION 6
 #define IPV6_MTU 1280
+#define MAX_REPORTED_PEERS 32
+#define PEER_FLAG_ROUTER 0x01
 
 typedef struct {
     uint16_t length;
@@ -85,13 +87,18 @@ static void thread_receive(otMessage *message, void *context)
 static void send_status(void)
 {
     otOperationalDatasetTlvs tlvs = {0};
-    uint8_t payload[3 + 2 * sizeof(otIp6Address) + OT_OPERATIONAL_DATASET_MAX_LENGTH + 17];
+    uint8_t payload[3 + 2 * sizeof(otIp6Address) + OT_OPERATIONAL_DATASET_MAX_LENGTH +
+                    18 + MAX_REPORTED_PEERS * 11];
     otInstance *instance;
     const otIp6Address *mleid;
     const otIp6Address *link_local;
     uint8_t child_count = 0;
     uint8_t router_neighbor_count = 0;
     uint16_t peer_rloc16 = 0xffff;
+    uint8_t peer_count = 0;
+    otExtAddress peer_extaddrs[MAX_REPORTED_PEERS];
+    uint16_t peer_rlocs[MAX_REPORTED_PEERS];
+    uint8_t peer_flags[MAX_REPORTED_PEERS];
 
     esp_openthread_lock_acquire(portMAX_DELAY);
     instance = esp_openthread_get_instance();
@@ -111,14 +118,51 @@ static void send_status(void)
         if (peer_rloc16 == 0xffff) {
             peer_rloc16 = child.mRloc16;
         }
+        if (peer_count < MAX_REPORTED_PEERS) {
+            peer_extaddrs[peer_count] = child.mExtAddress;
+            peer_rlocs[peer_count] = child.mRloc16;
+            peer_flags[peer_count] = 0;
+            peer_count++;
+        }
         child_count++;
+    }
+    uint16_t self_rloc16 = otThreadGetRloc16(instance);
+    if (otThreadGetDeviceRole(instance) == OT_DEVICE_ROLE_CHILD &&
+        peer_count < MAX_REPORTED_PEERS) {
+        otRouterInfo parent;
+        if (otThreadGetParentInfo(instance, &parent) == OT_ERROR_NONE) {
+            peer_extaddrs[peer_count] = parent.mExtAddress;
+            peer_rlocs[peer_count] = parent.mRloc16;
+            peer_flags[peer_count] = PEER_FLAG_ROUTER;
+            peer_count++;
+            peer_rloc16 = parent.mRloc16;
+            router_neighbor_count++;
+        }
     }
     for (uint8_t router_id = 0; router_id <= OT_NETWORK_MAX_ROUTER_ID; router_id++) {
         otRouterInfo router;
         if (otThreadGetRouterInfo(instance, router_id, &router) == OT_ERROR_NONE &&
-            router.mLinkEstablished) {
-            router_neighbor_count++;
-            peer_rloc16 = router.mRloc16;
+            router.mAllocated && router.mRloc16 != self_rloc16) {
+            if (router.mLinkEstablished) {
+                router_neighbor_count++;
+            }
+            if (peer_rloc16 == 0xffff) {
+                peer_rloc16 = router.mRloc16;
+            }
+            bool already_reported = false;
+            bool extaddr_is_zero = true;
+            for (size_t i = 0; i < sizeof(router.mExtAddress.m8); i++) {
+                extaddr_is_zero &= router.mExtAddress.m8[i] == 0;
+            }
+            for (uint8_t i = 0; i < peer_count; i++) {
+                already_reported |= peer_rlocs[i] == router.mRloc16;
+            }
+            if (!already_reported && !extaddr_is_zero && peer_count < MAX_REPORTED_PEERS) {
+                peer_extaddrs[peer_count] = router.mExtAddress;
+                peer_rlocs[peer_count] = router.mRloc16;
+                peer_flags[peer_count] = PEER_FLAG_ROUTER;
+                peer_count++;
+            }
         }
     }
     size_t offset = 3 + sizeof(*mleid) + payload[2];
@@ -135,6 +179,14 @@ static void send_status(void)
     payload[offset++] = router_neighbor_count;
     memcpy(payload + offset, &peer_rloc16, sizeof(peer_rloc16));
     offset += sizeof(peer_rloc16);
+    payload[offset++] = peer_count;
+    for (uint8_t i = 0; i < peer_count; i++) {
+        memcpy(payload + offset, peer_extaddrs[i].m8, sizeof(peer_extaddrs[i].m8));
+        offset += sizeof(peer_extaddrs[i].m8);
+        memcpy(payload + offset, &peer_rlocs[i], sizeof(peer_rlocs[i]));
+        offset += sizeof(peer_rlocs[i]);
+        payload[offset++] = peer_flags[i];
+    }
     esp_openthread_lock_release();
 
     queue_frame(FRAME_STATUS_RESPONSE, payload, offset);
@@ -346,7 +398,7 @@ void app_main(void)
     start_thread_network();
     esp_openthread_lock_release();
 
-    assert(xTaskCreate(usb_rx_task, "usb_rx", 4096, NULL, 4, NULL) == pdPASS);
+    assert(xTaskCreate(usb_rx_task, "usb_rx", 8192, NULL, 4, NULL) == pdPASS);
     assert(xTaskCreate(usb_tx_task, "usb_tx", 4096, NULL, 4, NULL) == pdPASS);
 
     /* The OpenThread mainloop remains on app_main's task. */
