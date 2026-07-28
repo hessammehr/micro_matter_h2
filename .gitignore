@@ -4,3 +4,4 @@ firmware/build/
 firmware/sdkconfig
 state/*
 !state/.gitkeep
+__marimo__/
