@@ -42,6 +42,7 @@
 #define IPV6_MTU 1280
 #define MAX_REPORTED_PEERS 32
 #define PEER_FLAG_ROUTER 0x01
+#define LEADER_WEIGHT 255
 
 typedef struct {
     uint16_t length;
@@ -349,6 +350,8 @@ static void start_thread_network(void)
                             ? ESP_OK
                             : ESP_FAIL);
     }
+
+    otThreadSetLocalLeaderWeight(instance, LEADER_WEIGHT);
 
     otIp6SetReceiveCallback(instance, thread_receive, NULL);
     otIp6SetReceiveFilterEnabled(instance, true);
