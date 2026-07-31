@@ -541,6 +541,25 @@ class MatterController:
             paaTrustStorePath=str(STATE_DIR / "paa-root-certs")
         )
         self.controller.SetThreadOperationalDataset(threadOperationalDataset=dataset)
+        self._install_session_retry()
+
+    def _install_session_retry(self) -> None:
+        from chip.exceptions import ChipStackError
+
+        controller = self.controller
+        send_command = controller.SendCommand
+
+        async def send_command_with_retry(*args, **kwargs):
+            try:
+                return await send_command(*args, **kwargs)
+            except ChipStackError:
+                node_id = kwargs.get("nodeid", args[0] if args else None)
+                if node_id is None:
+                    raise
+                controller.ExpireSessions(node_id)
+                return await send_command(*args, **kwargs)
+
+        controller.SendCommand = send_command_with_retry
 
     async def commission(self, code: str, node_id: int) -> None:
         from chip.discovery import DiscoveryType
