@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Commission and control Matter-over-Thread lights through an ESP32-H2."""
+"""Commission and control Matter-over-Thread devices through an ESP32-H2."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Final
+from typing import Any, Callable, Final
 
 import serial
 
@@ -36,6 +36,7 @@ IFF_TUN: Final = 0x0001
 IFF_NO_PI: Final = 0x1000
 TUN_NAME: Final = "matter0"
 ROLE_NAMES: Final = ["disabled", "detached", "child", "router", "leader"]
+INTERACTION_TIMEOUT_MS: Final = 3000
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = ROOT / "state"
 
@@ -74,13 +75,6 @@ class RadioStatus:
     @property
     def mesh_prefix(self) -> ipaddress.IPv6Network:
         return ipaddress.IPv6Network((self.mleid, 64), strict=False)
-
-    @property
-    def peer_address(self) -> ipaddress.IPv6Address | None:
-        if self.peer_rloc16 == 0xFFFF:
-            return None
-        iid = 0x000000FFFE000000 | self.peer_rloc16
-        return ipaddress.IPv6Address(int(self.mesh_prefix.network_address) | iid)
 
     def peer_by_extaddr(self, extaddr: str) -> ThreadPeer | None:
         normalized = extaddr.lower().replace(":", "")
@@ -230,17 +224,34 @@ def translate_mdns_to_host(packet: bytes) -> bytes:
     return packet
 
 
+def _dns_labels(buf: bytes, offset: int) -> tuple[list[bytes] | None, int]:
+    labels: list[bytes] = []
+    while offset < len(buf) and buf[offset]:
+        length = buf[offset]
+        offset += 1
+        if length > 63 or offset + length > len(buf):
+            return None, offset
+        labels.append(buf[offset : offset + length])
+        offset += length
+    return labels, offset + 1
+
+
 def _dns_name(labels: list[bytes]) -> bytes:
-    return b"".join(bytes((len(label),)) + label for label in labels) + b"\0"
+    return b"".join(bytes((len(label),)) + label for label in labels) + b"\x00"
 
 
-def synthesize_operational_mdns(
-    query_packet: bytes, peer_address: ipaddress.IPv6Address
+def answer_matter_query(
+    query_packet: bytes,
+    resolve: Callable[[bytes], list[ipaddress.IPv6Address]],
 ) -> bytes | None:
-    """Answer an operational Matter query with a known direct Thread locator.
+    """Answer a Matter operational DNS-SD query for a node we know about.
 
-    CASE still authenticates the peer. This substitutes only for broken mDNS
-    advertisement on the single-device test mesh.
+    Thread devices publish their operational service through an SRP server that
+    lives on a border router. This mesh has none, so nothing on the network
+    answers the controller's `_matter._tcp.local` lookups. The bridge answers
+    them from the node directory: `resolve` maps the queried service instance to
+    every address that currently reaches that node. Instances we cannot account
+    for get no answer at all.
     """
     if (
         len(query_packet) < 64
@@ -252,39 +263,37 @@ def synthesize_operational_mdns(
     if len(dns) < 17 or struct.unpack("!H", dns[4:6])[0] == 0:
         return None
 
-    labels: list[bytes] = []
-    offset = 12
-    while offset < len(dns) and dns[offset] != 0:
-        length = dns[offset]
-        offset += 1
-        if length > 63 or offset + length > len(dns):
-            return None
-        labels.append(dns[offset : offset + length])
-        offset += length
-    if offset + 5 > len(dns) or len(labels) < 4:
+    labels, _ = _dns_labels(dns, 12)
+    if labels is None or len(labels) < 4:
         return None
     if labels[-3:] != [b"_matter", b"_tcp", b"local"]:
         return None
 
-    instance = _dns_name(labels)
-    target = _dns_name([b"matter-h2-peer", b"local"])
+    instance = labels[0]
+    addresses = resolve(instance)
+    if not addresses:
+        return None
+
+    service = _dns_name(labels)
+    target = _dns_name([instance, b"local"])
     cache_flush_in = 0x8001
     ttl = 120
 
     def rr(name: bytes, rr_type: int, data: bytes) -> bytes:
         return name + struct.pack("!HHIH", rr_type, cache_flush_in, ttl, len(data)) + data
 
-    srv = rr(instance, 33, struct.pack("!HHH", 0, 0, 5540) + target)
-    txt_data = b"\x08SII=5000\x07SAI=300\x08SAT=4000"
-    txt = rr(instance, 16, txt_data)
-    aaaa = rr(target, 28, peer_address.packed)
-    dns_response = struct.pack("!HHHHHH", 0, 0x8400, 0, 2, 0, 1) + srv + txt + aaaa
+    answers = (
+        rr(service, 33, struct.pack("!HHH", 0, 0, 5540) + target)
+        + rr(service, 16, b"\x08SII=5000\x07SAI=300\x08SAT=4000")
+        + b"".join(rr(target, 28, address.packed) for address in addresses)
+    )
+    dns_response = struct.pack("!HHHHHH", 0, 0x8400, 0, 2 + len(addresses), 0, 0) + answers
 
     udp_length = 8 + len(dns_response)
     response = bytearray(40 + udp_length)
     response[0] = 0x60
     response[4:8] = struct.pack("!HBB", udp_length, socket.IPPROTO_UDP, 64)
-    response[8:24] = peer_address.packed
+    response[8:24] = addresses[0].packed
     response[24:40] = query_packet[8:24]
     source_port = struct.unpack("!H", query_packet[40:42])[0]
     response[40:48] = struct.pack("!HHHH", 5353, source_port, udp_length, 0)
@@ -297,11 +306,7 @@ class H2Bridge:
     def __init__(self, port: str) -> None:
         self.serial = serial.Serial(port, baudrate=115200, timeout=0.2, exclusive=True)
         self.trace = os.environ.get("MATTER_H2_TRACE") == "1"
-        self.peer_address: ipaddress.IPv6Address | None = None
-        self.selected_extaddr: str | None = None
-        self._fixed_peer_address: ipaddress.IPv6Address | None = None
-        self._select_new = False
-        self._baseline_extaddrs: set[str] = set()
+        self.resolve: Callable[[bytes], list[ipaddress.IPv6Address]] = lambda _: []
         self.decoder = SlipDecoder()
         self.status: RadioStatus | None = None
         self.tun_fd: int | None = None
@@ -311,42 +316,6 @@ class H2Bridge:
 
     def _apply_status(self, status: RadioStatus) -> None:
         self.status = status
-        if self._fixed_peer_address is not None:
-            self.peer_address = self._fixed_peer_address
-            return
-        if self._select_new and self.selected_extaddr is None:
-            candidates = [
-                peer for peer in status.peers
-                if peer.extaddr not in self._baseline_extaddrs
-            ]
-            if len(candidates) == 1:
-                self.selected_extaddr = candidates[0].extaddr
-        if self.selected_extaddr is not None:
-            peer = status.peer_by_extaddr(self.selected_extaddr)
-            self.peer_address = peer.address(status.mesh_prefix) if peer else None
-        elif len(status.peers) == 1 and not self._select_new:
-            self.peer_address = status.peers[0].address(status.mesh_prefix)
-        else:
-            self.peer_address = status.peer_address if not status.peers else None
-
-    def select_new_peer(self, status: RadioStatus) -> None:
-        self._fixed_peer_address = None
-        self._select_new = True
-        self._baseline_extaddrs = {peer.extaddr for peer in status.peers}
-        self.selected_extaddr = None
-        self.peer_address = None
-
-    def select_peer(self, extaddr: str, status: RadioStatus) -> None:
-        self._fixed_peer_address = None
-        self._select_new = False
-        self.selected_extaddr = extaddr.lower().replace(":", "")
-        self._apply_status(status)
-
-    def select_address(self, address: str, status: RadioStatus) -> None:
-        self._select_new = False
-        self.selected_extaddr = None
-        self._fixed_peer_address = ipaddress.IPv6Address(address)
-        self._apply_status(status)
 
     def send_frame(self, frame_type: int, payload: bytes = b"") -> None:
         frame = slip_encode(bytes((frame_type,)) + payload)
@@ -449,8 +418,7 @@ class H2Bridge:
                     f"Thread state: {self.status.role_name}, "
                     f"{self.status.child_count} children, "
                     f"{self.status.neighbor_count} neighbors, "
-                    f"{len(self.status.peers)} peers, selected "
-                    f"{self.selected_extaddr or 'none'} at {self.peer_address or 'none'}",
+                    f"{len(self.status.peers)} peers",
                     file=sys.stderr,
                 )
 
@@ -473,15 +441,14 @@ class H2Bridge:
                     continue
                 if packet:
                     assert self.status is not None
-                    if self.peer_address is not None:
-                        response = synthesize_operational_mdns(packet, self.peer_address)
-                        if response is not None:
-                            if self.trace:
-                                print(
-                                    f"synthetic DNS {packet_summary(response)}",
-                                    file=sys.stderr,
-                                )
-                            os.write(self.tun_fd, response)
+                    response = answer_matter_query(packet, self.resolve)
+                    if response is not None:
+                        if self.trace:
+                            print(
+                                f"DNS-SD answer {packet_summary(response)}",
+                                file=sys.stderr,
+                            )
+                        os.write(self.tun_fd, response)
                     # Send Thread mDNS at both scopes. Some devices answer
                     # link-local queries while others follow the Thread realm-local
                     # convention. Non-mDNS traffic produces only one packet.
@@ -544,20 +511,40 @@ class MatterController:
         self._install_session_retry()
 
     def _install_session_retry(self) -> None:
+        """Bound every invoke and recover from a device that drops one.
+
+        A device silently drops invokes past its concurrent-command limit: it
+        MRP-acks the request and never sends an InvokeCommandResponse. Without
+        an interaction timeout the caller awaits that response forever, so one
+        is always applied.
+
+        A dropped invoke means the device was momentarily busy, not that the
+        session broke, so the first recovery is a plain re-send. Tearing the
+        session down is a last resort and is serialised: ExpireSessions affects
+        every exchange with that peer, so doing it while other commands are in
+        flight cancels them too.
+        """
         from chip.exceptions import ChipStackError
 
         controller = self.controller
         send_command = controller.SendCommand
+        expiry_lock = asyncio.Lock()
 
         async def send_command_with_retry(*args, **kwargs):
+            kwargs.setdefault("interactionTimeoutMs", INTERACTION_TIMEOUT_MS)
+            try:
+                return await send_command(*args, **kwargs)
+            except ChipStackError:
+                pass
             try:
                 return await send_command(*args, **kwargs)
             except ChipStackError:
                 node_id = kwargs.get("nodeid", args[0] if args else None)
                 if node_id is None:
                     raise
-                controller.ExpireSessions(node_id)
-                return await send_command(*args, **kwargs)
+                async with expiry_lock:
+                    controller.ExpireSessions(node_id)
+                    return await send_command(*args, **kwargs)
 
         controller.SendCommand = send_command_with_retry
 
@@ -572,14 +559,12 @@ class MatterController:
         if result != node_id:
             raise RuntimeError(f"commissioned unexpected node ID {result}")
 
-    async def set_on(self, node_id: int, endpoint: int, value: bool) -> None:
-        from chip.clusters import Objects as Clusters
-
-        command = Clusters.OnOff.Commands.On() if value else Clusters.OnOff.Commands.Off()
+    async def send(self, node_id: int, endpoint: int, payload: Any) -> None:
+        """Invoke any cluster command on a commissioned node."""
         await self.controller.SendCommand(
             nodeid=node_id,
             endpoint=endpoint,
-            payload=command,
+            payload=payload,
         )
 
     def get_address(self, node_id: int) -> str | None:
@@ -647,6 +632,66 @@ def update_device_address(node_id: int, address: str | None) -> None:
         save_devices(registry)
 
 
+class NodeDirectory:
+    """Maps Matter node IDs to the Thread addresses that currently reach them.
+
+    Identity is durable and comes from the registry: a node ID is bound to a
+    Thread extended address once, at commissioning. Addresses are derived fresh
+    from live radio status on every lookup, so a node that moves to a new RLOC
+    stays reachable without re-commissioning and without stale cached state.
+
+    Constructing a directory installs it as the bridge's resolver. Wiring that
+    up by hand is a silent failure if forgotten: the bridge answers no queries
+    and every command times out in discovery.
+    """
+
+    def __init__(self, bridge: H2Bridge, registry: dict | None = None) -> None:
+        self.bridge = bridge
+        self.registry = load_devices() if registry is None else registry
+        self.pending_node_id: int | None = None
+        bridge.resolve = self.resolve
+
+    def addresses_for(self, node_id: int) -> list[ipaddress.IPv6Address]:
+        device = self.registry["devices"].get(str(node_id))
+        if device is None:
+            return self.unclaimed() if node_id == self.pending_node_id else []
+
+        addresses: list[ipaddress.IPv6Address] = []
+        stored = device.get("address")
+        if stored:
+            addresses.append(ipaddress.IPv6Address(stored))
+        status = self.bridge.status
+        extaddr = device.get("extaddr")
+        if status is not None and extaddr:
+            peer = status.peer_by_extaddr(extaddr)
+            if peer is not None:
+                live = peer.address(status.mesh_prefix)
+                if live not in addresses:
+                    addresses.append(live)
+        return addresses
+
+    def unclaimed(self) -> list[ipaddress.IPv6Address]:
+        """Peers on the mesh that no registered node has claimed yet."""
+        status = self.bridge.status
+        if status is None:
+            return []
+        known = {device.get("extaddr") for device in self.registry["devices"].values()}
+        return [
+            peer.address(status.mesh_prefix)
+            for peer in status.peers
+            if peer.extaddr not in known
+        ]
+
+    def resolve(self, instance: bytes) -> list[ipaddress.IPv6Address]:
+        """Resolve a `<compressed-fabric>-<node-id>` service instance."""
+        try:
+            _fabric, node_hex = instance.decode("ascii").rsplit("-", 1)
+            node_id = int(node_hex, 16)
+        except (UnicodeDecodeError, ValueError):
+            return []
+        return self.addresses_for(node_id)
+
+
 async def fetch_paa_certificates() -> None:
     from matter_server.server.helpers.paa_certificates import fetch_certificates
 
@@ -657,24 +702,14 @@ async def fetch_paa_certificates() -> None:
     )
 
 
-def migrate_legacy_device(status: RadioStatus) -> dict:
-    registry = load_devices()
-    unresolved = [
-        node_id for node_id, device in registry["devices"].items()
-        if not device.get("extaddr")
-    ]
-    if len(unresolved) == 1 and len(status.peers) == 1:
-        registry["devices"][unresolved[0]]["extaddr"] = status.peers[0].extaddr
-        save_devices(registry)
-    return registry
-
-
-async def wait_for_selected_peer(bridge: H2Bridge, timeout: float = 10) -> None:
+async def wait_for_node(
+    directory: NodeDirectory, node_id: int, timeout: float = 10
+) -> None:
     deadline = time.monotonic() + timeout
-    while bridge.peer_address is None and time.monotonic() < deadline:
+    while not directory.addresses_for(node_id) and time.monotonic() < deadline:
         await asyncio.sleep(0.2)
-    if bridge.peer_address is None:
-        raise RuntimeError("selected bulb is not currently visible on the Thread mesh")
+    if not directory.addresses_for(node_id):
+        raise RuntimeError(f"Matter node {node_id} is not visible on the Thread mesh")
 
 
 async def run_matter(
@@ -687,28 +722,22 @@ async def run_matter(
     if not status.dataset:
         raise RuntimeError("H2 returned no active Thread dataset")
 
-    registry = migrate_legacy_device(status)
+    registry = load_devices()
+    directory = NodeDirectory(bridge, registry)
+
     if args.command == "commission":
         node_id = args.node if args.node is not None else next_node_id(registry)
         if str(node_id) in registry["devices"]:
             raise RuntimeError(f"Matter node {node_id} is already registered")
-        bridge.select_new_peer(status)
+        baseline = {peer.extaddr for peer in status.peers}
+        directory.pending_node_id = node_id
         sudo("rfkill", "unblock", "bluetooth")
         await fetch_paa_certificates()
     else:
         node_id = args.node if args.node is not None else stored_node_id()
-        device = registry["devices"].get(str(node_id))
-        if device is None:
+        if str(node_id) not in registry["devices"]:
             raise RuntimeError(f"Matter node {node_id} is not registered")
-        address = device.get("address")
-        extaddr = device.get("extaddr")
-        if address:
-            bridge.select_address(address, status)
-        elif extaddr:
-            bridge.select_peer(extaddr, status)
-            await wait_for_selected_peer(bridge)
-        else:
-            raise RuntimeError(f"Thread identity for Matter node {node_id} is unknown")
+        await wait_for_node(directory, node_id)
 
     controller = MatterController(status.dataset, bluetooth_adapter=0)
     try:
@@ -716,14 +745,24 @@ async def run_matter(
             code = args.code or input("Matter setup code: ").strip()
             code = code.replace(" ", "")
             await controller.commission(code, node_id)
-            if bridge.selected_extaddr is None:
-                raise RuntimeError("commissioned bulb has no Thread peer identity")
-            store_device(
-                node_id, bridge.selected_extaddr, controller.get_address(node_id)
-            )
+            joined = [
+                peer.extaddr
+                for peer in (bridge.status.peers if bridge.status else ())
+                if peer.extaddr not in baseline
+            ]
+            if len(joined) != 1:
+                raise RuntimeError(f"expected one new Thread peer, saw {joined}")
+            store_device(node_id, joined[0], controller.get_address(node_id))
             print(f"Commissioned as node {node_id}")
         elif args.command in ("on", "off"):
-            await controller.set_on(node_id, args.endpoint, args.command == "on")
+            from chip.clusters import Objects as Clusters
+
+            command = (
+                Clusters.OnOff.Commands.On()
+                if args.command == "on"
+                else Clusters.OnOff.Commands.Off()
+            )
+            await controller.send(node_id, args.endpoint, command)
             update_device_address(node_id, controller.get_address(node_id))
             print(f"Node {node_id} endpoint {args.endpoint}: {args.command}")
     finally:
@@ -735,12 +774,12 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", default="/dev/ttyACM0", help="H2 USB serial port")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("radio", help="show H2 Thread status without creating a TUN interface")
-    commission = sub.add_parser("commission", help="commission the bulb over BLE + Thread")
+    commission = sub.add_parser("commission", help="commission a device over BLE + Thread")
     commission.add_argument("--code", help="Matter manual/QR setup code; prompted if omitted")
     commission.add_argument("--node", type=int, help="Matter node ID (default: next free)")
-    sub.add_parser("list", help="list commissioned bulbs and current Thread peers")
+    sub.add_parser("list", help="list commissioned devices and current Thread peers")
     for name in ("on", "off"):
-        command = sub.add_parser(name, help=f"turn a commissioned bulb {name}")
+        command = sub.add_parser(name, help=f"turn a commissioned device {name}")
         command.add_argument("--node", type=int)
         command.add_argument("--endpoint", type=int, default=1)
     sub.add_parser("cleanup", help="remove the local matter0 TUN interface")
@@ -766,16 +805,16 @@ async def async_main(args: argparse.Namespace) -> None:
             f"(last OT error {status.last_inject_error}), Thread→host {status.received_packets}"
         )
         if args.command == "list":
-            registry = migrate_legacy_device(status)
+            registry = load_devices()
+            directory = NodeDirectory(bridge, registry)
             default_node = registry.get("default_node")
             for node_id, device in sorted(
                 registry["devices"].items(), key=lambda item: int(item[0])
             ):
                 extaddr = device.get("extaddr")
                 peer = status.peer_by_extaddr(extaddr) if extaddr else None
-                address = device.get("address")
-                if address is None and peer:
-                    address = str(peer.address(status.mesh_prefix))
+                addresses = directory.addresses_for(int(node_id))
+                address = str(addresses[0]) if addresses else None
                 state = "online" if peer else "not directly visible"
                 marker = "*" if int(node_id) == default_node else " "
                 print(

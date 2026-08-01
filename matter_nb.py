@@ -13,11 +13,13 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    import matter_h2
     from matter_h2 import MatterController, H2Bridge
     from chip.clusters import Objects as Clusters
     import marimo as mo
 
-    return Clusters, H2Bridge, MatterController, mo
+
+    return Clusters, H2Bridge, MatterController, matter_h2, mo
 
 
 @app.cell
@@ -39,15 +41,45 @@ def _(status):
 
 
 @app.cell
+def _(bridge, matter_h2, mo):
+    directory = matter_h2.NodeDirectory(bridge)
+    node_id = matter_h2.stored_node_id()
+
+    mo.md("### node directory\n\n" + "\n".join(
+        f"- node **{_n}** `{_d['extaddr']}` -> "
+        + (", ".join(f"`{_a}`" for _a in directory.addresses_for(int(_n))) or "_not on mesh_")
+        for _n, _d in directory.registry["devices"].items()))
+    return directory, node_id
+
+
+@app.cell
 def _(MatterController, dataset):
     controller = MatterController(dataset)
     return (controller,)
 
 
 @app.cell
+def _(Clusters, controller):
+    async def set_on(node, endpoint, value):
+        await controller.send(
+            node, endpoint,
+            Clusters.OnOff.Commands.On() if value else Clusters.OnOff.Commands.Off(),
+        )
+
+
+    async def set_brightness(node, endpoint, level):
+        await controller.send(
+            node, endpoint, Clusters.LevelControl.Commands.MoveToLevel(level)
+        )
+
+
+    return set_brightness, set_on
+
+
+@app.cell
 def _(mo):
     on_off = mo.ui.checkbox(label='On/Off', value=True)
-    slider = mo.ui.slider(start=0, stop=254, step=1, debounce=True, label='Brightness level', value=128)
+    slider = mo.ui.slider(start=0, stop=254, step=1, debounce=False, label='Brightness level', value=128)
 
     mo.vstack([on_off, slider], align='center')
     return on_off, slider
@@ -61,12 +93,16 @@ def _(mo):
 
 
 @app.cell(hide_code=True)
-def _(bridge, mesh_watch, mo):
+def _(bridge, directory, mesh_watch, mo):
     mesh_watch
     _s = bridge.status
     _role = ["disabled", "detached", "child", "router", "leader"][_s.role]
     _peers = "<br>".join(f"`{p.extaddr}` rloc16=0x{p.rloc16:04x}{' router' if p.is_router else ''}"
                          for p in _s.peers) or "_none_"
+    _nodes = "<br>".join(
+        f"**{_n}** -> " + (", ".join(f"`{_a}`" for _a in directory.addresses_for(int(_n)))
+                           or "_unreachable_")
+        for _n in directory.registry["devices"]) or "_none_"
     mo.md(f"""
     | | |
     |---|---|
@@ -74,22 +110,22 @@ def _(bridge, mesh_watch, mo):
     | children / neighbors | **{_s.child_count} / {_s.neighbor_count}** |
     | peers | {_peers} |
     | rx / injected / rejected | {_s.received_packets} / {_s.injected_packets} / {_s.rejected_packets} |
-    | bridge peer address | `{bridge.peer_address}` |
+    | nodes | {_nodes} |
     """)
     return
 
 
 @app.cell
-async def _(controller, on_off):
-    await controller.set_on(1, 1, on_off.value)
+async def _(node_id, on_off, set_on):
+    await set_on(node_id, 1, on_off.value)
+
     return
 
 
 @app.cell
-async def _(Clusters, controller, slider):
-    payload = Clusters.LevelControl.Commands.MoveToLevel(slider.value)
-    inner_controller = controller.controller
-    await inner_controller.SendCommand(1, 1, payload=payload)
+async def _(node_id, set_brightness, slider):
+    await set_brightness(node_id, 1, slider.value)
+
     return
 
 
